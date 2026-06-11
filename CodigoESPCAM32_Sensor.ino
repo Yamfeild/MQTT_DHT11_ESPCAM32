@@ -5,53 +5,38 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <DHT.h>
+#include <WiFiManager.h> // <-- LIBRERÍA NUEVA
 
-// ---- Configuración de red ----
-const char* WIFI_SSID     = "deivys";       // Pon el nombre de tu Wi-Fi
-const char* WIFI_PASSWORD = "abcd1234";     // Pon tu contraseña
+// ---- Ya NO hay credenciales quemadas ----
 
-// ---- Configuración MQTT (Tu servidor FastAPI) ----
-// Aquí debes poner la IP de tu laptop "Master-David" (búscala ejecutando 'ip a' en la terminal)
-const char* MQTT_BROKER   = "10.168.240.187"; 
+// Variable para guardar la IP que el usuario escriba en el portal web
+char mqtt_server[40] = ""; 
 const int   MQTT_PORT     = 1884;
 
-// El tópico exacto que programaste en app/mqtt/client.py
+// El tópico exacto
 const char* TOPIC_CLIMA   = "unl/clima/esp32"; 
 
 // ---- Configuración DHT11 ----
-// Usaremos el GPIO 15, que está disponible en la ESP32-CAM (Pin U0R no se toca)
 #define DHTPIN    15       
 #define DHTTYPE   DHT11    
 
 DHT dht(DHTPIN, DHTTYPE);
 
-// En la ESP32-CAM, el LED rojo pequeño interno está en el pin 33 (lógica invertida)
+// En la ESP32-CAM, el LED rojo pequeño interno está en el pin 33
 #define LED_PIN   33        
-// El sensor DHT11 es lento. 5 segundos es el tiempo ideal para no saturarlo
 #define INTERVALO 300000     
 
 WiFiClient   espClient;
 PubSubClient client(espClient);
 unsigned long lastMsg = 0;
 
-// ---- Conectar WiFi ----
-void setup_wifi() {
-  Serial.print("Conectando a ");
-  Serial.println(WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\n✓ WiFi conectado. IP: ");
-  Serial.println(WiFi.localIP());
-}
-
-// ---- Reconectar a tu Mosquitto Local ----
+// ---- Reconectar a Mosquitto (Actualizado para IP dinámica) ----
 void reconnect() {
   while (!client.connected()) {
-    Serial.print("Conectando a Mosquitto Docker...");
+    Serial.print("Conectando a Mosquitto en la IP: ");
+    Serial.print(mqtt_server);
+    Serial.print("...");
+    
     // Client ID aleatorio
     String clientId = "ESP32CAM-Sensor-";
     clientId += String(random(0xffff), HEX);
@@ -71,14 +56,46 @@ void reconnect() {
 void setup() {
   Serial.begin(115200);
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH); // Apagar LED al inicio (HIGH lo apaga en el pin 33)
+  digitalWrite(LED_PIN, HIGH); // Apagar LED al inicio
   
-  dht.begin();                // Inicializar DHT11
-  setup_wifi();
-  client.setServer(MQTT_BROKER, MQTT_PORT);
+  dht.begin();                
+
+  // ---- Inicia el WiFiManager ----
+  WiFiManager wm;
+  
+  // DESCOMENTA LA SIGUIENTE LÍNEA si quieres borrar la memoria de la ESP32 
+  // para forzar que el portal web aparezca siempre que la enciendas (útil para pruebas)
+  wm.resetSettings(); 
+
+  // Crea la caja de texto en la página web para pedir la IP
+  WiFiManagerParameter custom_mqtt_server("server", "IP del Broker MQTT (PC destino)", mqtt_server, 40);
+  wm.addParameter(&custom_mqtt_server);
+
+  Serial.println("Buscando red conocida o levantando Portal Cautivo...");
+  
+  // Si no se puede conectar, levanta la red abierta "Sensor-UNL-Config"
+  if (!wm.autoConnect("Sensor-UNL-Config")) {
+    Serial.println("Fallo al conectar y timeout alcanzó");
+    delay(3000);
+    ESP.restart(); // Reinicia y vuelve a intentar
+  }
+
+  // Si pasa de esta línea, significa que ya se conectó a un Wi-Fi
+  Serial.println("\n✓ WiFi conectado.");
+  Serial.print("IP asignada a la placa: ");
+  Serial.println(WiFi.localIP());
+
+  // Lee el valor que el compañero haya escrito en el campo web y lo guarda
+  strcpy(mqtt_server, custom_mqtt_server.getValue());
+  
+  Serial.print("IP del servidor guardada: ");
+  Serial.println(mqtt_server);
+
+  // Configura el cliente MQTT con la IP obtenida del portal web
+  client.setServer(mqtt_server, MQTT_PORT);
 }
 
-// ---- Loop principal ----
+// ---- Loop principal (SIN CAMBIOS EN LA LÓGICA) ----
 void loop() {
   if (!client.connected()) reconnect();
   client.loop(); // Mantiene viva la conexión MQTT
@@ -91,10 +108,9 @@ void loop() {
     float t = dht.readTemperature();
     float h = dht.readHumidity();
 
-    // Verificar si la lectura falló (sensor desconectado o error de lectura)
     if (isnan(t) || isnan(h)) {
       Serial.println("[ERROR] Fallo de lectura DHT11. Revisa los cables.");
-      return; // Aborta este ciclo y vuelve a intentar en 5 minutos
+      return; 
     }
 
     // 2. Inicializamos las variables de control en estado seguro
@@ -115,25 +131,24 @@ void loop() {
         mensaje_alerta += "Humedad Alta (>85%). ";
     }
 
-    // Si ninguna alerta se activó, el estado es completamente normal
     if (!alerta_climatica) {
         mensaje_alerta = "Normal";
     }
 
-    // 4. Armamos el JSON con el detalle específico del problema
+    // 4. Armamos el JSON 
     String mensaje_json = "{";
     mensaje_json += "\"temperatura\": " + String(t, 1) + ", ";
     mensaje_json += "\"humedad\": " + String(h, 1) + ", ";
     mensaje_json += "\"alerta\": " + (alerta_climatica ? String("true") : String("false")) + ", ";
     mensaje_json += "\"detalles_alerta\": \"" + mensaje_alerta + "\"";
     mensaje_json += "}";
+    
     // 5. Publicar en Mosquitto 
     client.publish(TOPIC_CLIMA, mensaje_json.c_str());
 
     Serial.print("[PUB] Enviado a FastAPI -> ");
     Serial.println(mensaje_json);
 
-    // Parpadeo del LED para confirmar envío visualmente en la placa
     digitalWrite(LED_PIN, LOW);  // Encender
     delay(100);
     digitalWrite(LED_PIN, HIGH); // Apagar
